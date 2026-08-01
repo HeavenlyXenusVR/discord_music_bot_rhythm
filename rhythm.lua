@@ -75,11 +75,29 @@ local LOG_DIR = env(PREFIX .. "_LOG_DIR", env("MUSIC_BOT_LOG_DIR", "/app/logs"))
 pcall(function() os.execute("mkdir -p '" .. LOG_DIR .. "'") end)
 local LOG_FILE = LOG_DIR .. "/rhythm.log"
 
+-- Matches alucard.py's RotatingFileHandler (10MB x 5 backups by default,
+-- same env var names) -- LOG_FILE previously grew unbounded forever.
+local LOG_MAX_BYTES = tonumber(env("MUSIC_BOT_LOG_MAX_BYTES", "10485760")) or 10485760
+local LOG_BACKUP_COUNT = tonumber(env("MUSIC_BOT_LOG_BACKUP_COUNT", "5")) or 5
+
+local function rotate_log_if_needed()
+  local f = io.open(LOG_FILE, "r")
+  if not f then return end
+  local size = f:seek("end")
+  f:close()
+  if not size or size < LOG_MAX_BYTES then return end
+  for i = LOG_BACKUP_COUNT - 1, 1, -1 do
+    os.rename(LOG_FILE .. "." .. i, LOG_FILE .. "." .. (i + 1))
+  end
+  os.rename(LOG_FILE, LOG_FILE .. ".1")
+end
+
 local function logline(level, fmt, ...)
   local ok, msg = pcall(string.format, fmt, ...)
   if not ok then msg = fmt end
   local line = string.format("%s %-5s rhythm  %s", os.date("%Y-%m-%d %H:%M:%S"), level, msg)
   print(line)
+  rotate_log_if_needed()
   local f = io.open(LOG_FILE, "a")
   if f then f:write(line .. "\n"); f:close() end
 end
@@ -2395,6 +2413,55 @@ local function start_background_loops()
       end)
     end
   end)
+
+  -- SwarmPanel/Aria remote-control bridge -- was entirely missing, so the
+  -- panel's PAUSE/RESUME/SKIP/STOP/RESTART buttons silently did nothing for
+  -- this bot. Same poll-and-execute-then-delete pattern as alucard.lua/
+  -- gws.lua/sapphire.lua.
+  copas.addthread(function()
+    while true do
+      copas.sleep(10)
+      local ok, err = pcall(function()
+        local rows = q("SELECT guild_id, command FROM rhythm_swarm_overrides WHERE bot_name = 'rhythm'") or {}
+        for _, row in ipairs(rows) do
+          local guild_id = tostring(row.guild_id)
+          local cmd_name = (row.command or ""):upper()
+          local executed = false
+          if cmd_name == "RESTART" then
+            q("DELETE FROM rhythm_swarm_overrides WHERE guild_id = %s AND bot_name = 'rhythm'", guild_id)
+            log_info("Aria requested a restart.")
+            os.exit(0)
+          elseif cmd_name == "PAUSE" and playback[guild_id] and not playback[guild_id].paused then
+            playback[guild_id].paused = true
+            playback[guild_id].offset = current_position(guild_id)
+            bot.lavalink:set_paused(guild_id, true)
+            executed = true
+          elseif cmd_name == "RESUME" and playback[guild_id] and playback[guild_id].paused then
+            playback[guild_id].paused = false
+            playback[guild_id].start_time = socket.gettime()
+            bot.lavalink:set_paused(guild_id, false)
+            executed = true
+          elseif cmd_name == "SKIP" and playback[guild_id] then
+            bot.lavalink:stop(guild_id)
+            executed = true
+          elseif cmd_name == "STOP" then
+            stop_playback(guild_id)
+            executed = true
+          end
+          if executed then
+            log_info("Aria executed %s in guild %s.", cmd_name, guild_id)
+          end
+          q("DELETE FROM rhythm_swarm_overrides WHERE guild_id = %s AND bot_name = 'rhythm' AND command = %s", guild_id, row.command)
+        end
+      end)
+      if not ok then
+        log_warn("swarm override poll error: %s", tostring(err))
+        -- rhythm.lua has no report_error/webhook plumbing (documented in
+        -- alucard.lua's header as a known gap vs alucard/rhythm's Python
+        -- originals); log_warn is the only sink this file has.
+      end
+    end
+  end)
 end
 
 -- ===========================================================================
@@ -2409,7 +2476,18 @@ log_info("RHYTHM booting -- %d commands registered, Lavalink at %s:%d", (functio
 -- queue) when this process last stopped -- container recreates/restarts
 -- otherwise leave the bot sitting disconnected with a full queue and no
 -- way back in short of a manual /play.
+-- BUGFIX: the Discord gateway sends a fresh READY (not RESUMED) on every
+-- invalidated session -- routine reconnects, not just process restarts --
+-- and this handler used to redo its full boot-resume/background-loop-spawn
+-- pass every single time, which both force-restarted/discarded queued
+-- tracks on reconnect and piled up duplicate background loops. Gate on
+-- did_initial_ready so it runs exactly once per process (matching what it was
+-- actually written for).
+local did_initial_ready = false
+
 bot.gateway:on("READY", function()
+  if did_initial_ready then return end
+  did_initial_ready = true
   copas.addthread(function()
     -- Wait for the Lavalink websocket to actually be connected before
     -- touching the queue -- process_queue deletes each row before resolving
